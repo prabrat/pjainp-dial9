@@ -92,4 +92,7 @@ node dial9-viewer/ui/test_flamegraph_export.js
 echo "--- Checking runtime grouping (multi-runtime lanes) ---"
 node dial9-viewer/ui/test_runtime_groups.js
 
+echo "--- Checking trace-graph view helpers (latency, filter, ELK input) ---"
+node dial9-viewer/ui/test_trace_graph_api.js
+
 echo "All E2E trace checks passed."

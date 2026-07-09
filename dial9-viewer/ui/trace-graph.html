@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Service Architecture</title>
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body {
+                background: #14182b;
+                color: #e0e0e0;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                font-size: 14px;
+                display: flex;
+                flex-direction: column;
+                height: 100vh;
+                overflow: hidden;
+            }
+            #header {
+                display: flex;
+                align-items: center;
+                gap: 16px;
+                padding: 8px 16px;
+                background: #16213e;
+                border-bottom: 1px solid #2a3350;
+                flex-shrink: 0;
+                flex-wrap: wrap;
+            }
+            #header h1 {
+                font-size: 15px;
+                font-weight: 600;
+                white-space: nowrap;
+            }
+            #stats { font-size: 12px; color: #9aa0b5; }
+            .ctl {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                font-size: 12px;
+                color: #9aa0b5;
+            }
+            .ctl button, .ctl input[type="range"] { cursor: pointer; }
+            .ctl button {
+                background: #1a2430;
+                border: 1px solid #33405a;
+                color: #9fdcff;
+                border-radius: 4px;
+                padding: 3px 9px;
+                font-size: 12px;
+            }
+            .ctl button:hover { background: #22314a; }
+            #graph-wrap {
+                flex: 1;
+                min-height: 0;
+                overflow: auto;
+                position: relative;
+            }
+            #graph-svg { display: block; }
+            #status {
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                color: #9aa0b5;
+                font-size: 13px;
+                text-align: center;
+            }
+            #status.err { color: #ff8a80; }
+            .legend {
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                font-size: 11px;
+                color: #9aa0b5;
+            }
+            .legend .dot { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+            /* SVG element styling */
+            #graph-svg .cluster-box { stroke-dasharray: 5 4; stroke-width: 1; }
+            #graph-svg .cluster-label {
+                font: 600 10px "SFMono-Regular", Consolas, monospace;
+                letter-spacing: 0.04em;
+                text-transform: uppercase;
+                pointer-events: none;
+            }
+            #graph-svg .edge { fill: none; }
+            #graph-svg .node-box { stroke-width: 1; }
+            #graph-svg .node-accent { }
+            #graph-svg .node-label {
+                fill: #e6e6f0;
+                font: 600 13px "SFMono-Regular", Consolas, monospace;
+                pointer-events: none;
+            }
+            #graph-svg .node-desc {
+                fill: #9aa0b5;
+                font: 11px "SFMono-Regular", Consolas, monospace;
+                pointer-events: none;
+            }
+            #graph-svg .node-badge {
+                font: 600 11px "SFMono-Regular", Consolas, monospace;
+                pointer-events: none;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="header">
+            <h1>Service Architecture</h1>
+            <span id="stats"></span>
+            <span class="ctl">
+                <label>min edge
+                    <input id="min-edge" type="range" min="1" max="60" value="1" style="width:110px;vertical-align:middle" />
+                    <span id="min-edge-val">1</span>
+                </label>
+            </span>
+            <span class="ctl">
+                <button id="toggle-runtime">Show runtime</button>
+            </span>
+            <span class="ctl">
+                <button id="zoom-out" title="Zoom out">−</button>
+                <button id="zoom-reset" title="Fit">⤢</button>
+                <button id="zoom-in" title="Zoom in">+</button>
+            </span>
+            <span class="legend"><span class="dot" style="background:#25e192"></span>&lt;1ms</span>
+            <span class="legend"><span class="dot" style="background:#ffcc56"></span>1–5ms</span>
+            <span class="legend"><span class="dot" style="background:#e5484d"></span>&gt;5ms</span>
+        </div>
+        <div id="graph-wrap">
+            <svg id="graph-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+            <div id="status">Loading…</div>
+        </div>
+
+        <script src="elk.bundled.js"></script>
+        <script src="sse.js"></script>
+        <script src="creds.js"></script>
+        <script src="trace_graph_api.js"></script>
+        <script>
+            (function () {
+                "use strict";
+                const TG = window.TraceGraphApi;
+                const SVG_NS = "http://www.w3.org/2000/svg";
+                const elk = typeof ELK !== "undefined" ? new ELK() : null;
+
+                const params = new URLSearchParams(window.location.search);
+                const svg = document.getElementById("graph-svg");
+                const statusEl = document.getElementById("status");
+                const statsEl = document.getElementById("stats");
+                const wrap = document.getElementById("graph-wrap");
+
+                // View state.
+                let hideRuntime = true;
+                let minEdge = 1;
+                let zoom = 1;
+                let baseW = 0, baseH = 0;
+                let latestGraph = null; // last {nodes, edges, meta} from the stream
+                let renderToken = 0;
+
+                function svgEl(name, attrs) {
+                    const el = document.createElementNS(SVG_NS, name);
+                    if (attrs) for (const k in attrs) el.setAttribute(k, attrs[k]);
+                    return el;
+                }
+                function showStatus(msg, isErr) {
+                    statusEl.textContent = msg;
+                    statusEl.className = isErr ? "err" : "";
+                    statusEl.style.display = msg ? "block" : "none";
+                }
+
+                // ── Render one graph snapshot ──
+                async function render() {
+                    if (!latestGraph || !elk) return;
+                    const meta = latestGraph.meta;
+                    const filtered = TG.filterGraph(latestGraph, { hideRuntime, minEdge });
+
+                    statsEl.textContent =
+                        `${filtered.nodes.length} components · ${filtered.edges.length} edges · ` +
+                        (meta.requests > 1
+                            ? `${Number(meta.total_samples).toLocaleString()} samples · per-request latency`
+                            : `${Number(meta.total_samples).toLocaleString()} samples · per-window wall time`);
+
+                    if (!filtered.nodes.length) {
+                        while (svg.firstChild) svg.removeChild(svg.firstChild);
+                        showStatus("No components above the edge-weight threshold — lower it.", false);
+                        return;
+                    }
+
+                    const token = ++renderToken;
+                    let laid;
+                    try {
+                        laid = await elk.layout(TG.buildElkGraph(filtered));
+                    } catch (e) {
+                        showStatus("Layout failed: " + e, true);
+                        return;
+                    }
+                    if (token !== renderToken) return; // superseded
+                    showStatus("", false);
+                    draw(laid, filtered, meta);
+                }
+
+                // Draw ELK output to SVG in a React-Flow-like style: dashed crate
+                // group boxes with an uppercase label, rounded module nodes with a
+                // heat-colored left accent bar + label + latency description + badge,
+                // and weighted bezier edges (top→bottom flow).
+                function draw(laid, filtered, meta) {
+                    while (svg.firstChild) svg.removeChild(svg.firstChild);
+                    const M = 16;
+                    const W = Math.max(240, (laid.width || 0) + 2 * M);
+                    const H = Math.max(120, (laid.height || 0) + 2 * M);
+                    baseW = W; baseH = H;
+                    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+                    svg.setAttribute("width", W * zoom);
+                    svg.setAttribute("height", H * zoom);
+                    const root = svgEl("g", { transform: `translate(${M},${M})` });
+                    svg.appendChild(root);
+
+                    // Absolute node positions (ELK child coords are relative to their
+                    // crate cluster) + cluster boxes.
+                    const nodeById = new Map(filtered.nodes.map((n) => [n.id, n]));
+                    const pos = new Map(); // id → {x,y,w,h}
+                    for (const cluster of laid.children || []) {
+                        const crate = cluster.id.replace(/^crate:/, "");
+                        const color = TG.crateColor(crate);
+                        const cx = cluster.x || 0, cy = cluster.y || 0;
+                        root.appendChild(svgEl("rect", {
+                            class: "cluster-box",
+                            x: cx, y: cy, width: cluster.width || 200, height: cluster.height || 120,
+                            rx: 10, fill: color, "fill-opacity": 0.05, stroke: color, "stroke-opacity": 0.4,
+                        }));
+                        const label = svgEl("text", {
+                            class: "cluster-label", x: cx + 12, y: cy + 15, fill: color,
+                        });
+                        label.textContent = crate;
+                        root.appendChild(label);
+                        for (const child of cluster.children || []) {
+                            pos.set(child.id, {
+                                x: cx + (child.x || 0),
+                                y: cy + (child.y || 0),
+                                w: child.width || TG.NODE_W,
+                                h: child.height || TG.NODE_H,
+                            });
+                        }
+                    }
+
+                    // Edges (behind nodes): vertical beziers, weight-scaled.
+                    const maxCount = filtered.edges.reduce((m, e) => Math.max(m, e.count), 1);
+                    for (const e of filtered.edges) {
+                        const a = pos.get(e.source), b = pos.get(e.target);
+                        if (!a || !b) continue;
+                        const acx = a.x + a.w / 2, bcx = b.x + b.w / 2;
+                        const down = b.y >= a.y + a.h;
+                        const y1 = down ? a.y + a.h : a.y;
+                        const y2 = down ? b.y : b.y + b.h;
+                        const dy = Math.max(24, Math.abs(y2 - y1) * 0.5) * (down ? 1 : -1);
+                        const st = TG.edgeStyle(e.count, maxCount);
+                        const path = svgEl("path", {
+                            class: "edge",
+                            d: `M ${acx} ${y1} C ${acx} ${y1 + dy}, ${bcx} ${y2 - dy}, ${bcx} ${y2}`,
+                            stroke: "#23c4f8",
+                            "stroke-opacity": st.opacity.toFixed(2),
+                            "stroke-width": st.width.toFixed(2),
+                        });
+                        const title = svgEl("title");
+                        title.textContent = `${e.source} → ${e.target}: ${Number(e.count).toLocaleString()} shared samples`;
+                        path.appendChild(title);
+                        root.appendChild(path);
+                    }
+
+                    // Nodes.
+                    for (const [id, p] of pos) {
+                        const n = nodeById.get(id);
+                        if (!n) continue;
+                        const wallMs = TG.nodeWallMs(n, meta);
+                        const blockedMs = TG.nodeBlockedMs(n, meta);
+                        const heat = TG.latHeat(wallMs);
+                        const crateCol = TG.crateColor(n.crate_name);
+                        const g = svgEl("g");
+                        g.appendChild(svgEl("rect", {
+                            class: "node-box", x: p.x, y: p.y, width: p.w, height: p.h, rx: 6,
+                            fill: "#1e2b4d", stroke: crateCol, "stroke-opacity": 0.75,
+                        }));
+                        g.appendChild(svgEl("rect", {
+                            class: "node-accent", x: p.x, y: p.y, width: 3, height: p.h, rx: 1.5, fill: heat,
+                        }));
+                        const label = svgEl("text", { class: "node-label", x: p.x + 14, y: p.y + 22 });
+                        label.textContent = truncate(n.module, 26);
+                        g.appendChild(label);
+                        const desc = svgEl("text", { class: "node-desc", x: p.x + 14, y: p.y + 40 });
+                        const reqSfx = meta.requests > 1 ? "/req" : "";
+                        desc.textContent = blockedMs >= 0.05
+                            ? `${TG.fmtMs(wallMs)}${reqSfx} · ${TG.fmtMs(blockedMs)} blocked`
+                            : `${TG.fmtMs(wallMs)}${reqSfx}`;
+                        g.appendChild(desc);
+                        const badge = svgEl("text", {
+                            class: "node-badge", x: p.x + p.w - 12, y: p.y + 22,
+                            "text-anchor": "end", fill: heat,
+                        });
+                        badge.textContent = TG.fmtMs(wallMs) + reqSfx;
+                        g.appendChild(badge);
+                        const title = svgEl("title");
+                        title.textContent =
+                            `${n.id}\n${Number(n.samples).toLocaleString()} samples (${TG.fmtMs(wallMs)}${reqSfx})` +
+                            (n.off_cpu ? `\n${Number(n.off_cpu).toLocaleString()} off-CPU (${TG.fmtMs(blockedMs)} blocked)` : "");
+                        g.appendChild(title);
+                        root.appendChild(g);
+                    }
+                }
+
+                function truncate(s, n) {
+                    return s.length > n ? s.slice(0, n - 1) + "…" : s;
+                }
+                function applyZoom() {
+                    if (!baseW) return;
+                    svg.setAttribute("width", baseW * zoom);
+                    svg.setAttribute("height", baseH * zoom);
+                }
+
+                // ── Controls ──
+                document.getElementById("min-edge").addEventListener("input", (ev) => {
+                    minEdge = Number(ev.target.value);
+                    document.getElementById("min-edge-val").textContent = String(minEdge);
+                    render();
+                });
+                const rtBtn = document.getElementById("toggle-runtime");
+                rtBtn.addEventListener("click", () => {
+                    hideRuntime = !hideRuntime;
+                    rtBtn.textContent = hideRuntime ? "Show runtime" : "Hide runtime";
+                    render();
+                });
+                document.getElementById("zoom-in").addEventListener("click", () => { zoom = Math.min(4, zoom * 1.25); applyZoom(); });
+                document.getElementById("zoom-out").addEventListener("click", () => { zoom = Math.max(0.25, zoom * 0.8); applyZoom(); });
+                document.getElementById("zoom-reset").addEventListener("click", () => { zoom = 1; applyZoom(); });
+
+                // ── Stream ──
+                if (!elk) { showStatus("ELK layout library failed to load.", true); return; }
+                const url = TG.buildTraceGraphUrl(window.location.origin, params, {
+                    appPrefixes: params.getAll("app_prefix"),
+                    requests: params.get("requests") ? Number(params.get("requests")) : 1,
+                });
+                const credHeaders = window.Dial9Creds ? Dial9Creds.headers() : {};
+                showStatus("Building architecture from traces…", false);
+                Dial9Sse.openSse(url, {
+                    headers: credHeaders,
+                    onEvent: (resp) => {
+                        latestGraph = resp;
+                        render();
+                    },
+                    onClose: () => {
+                        // Stream closed — the graph is the fully-folded snapshot.
+                    },
+                    onError: (err) => {
+                        showStatus("Failed to load: " + (err && err.message ? err.message : err), true);
+                    },
+                });
+            })();
+        </script>
+    </body>
+</html>

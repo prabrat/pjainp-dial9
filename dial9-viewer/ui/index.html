@@ -357,6 +357,9 @@
         <button id="health-btn" onclick="viewTokioStats()" disabled title="Open Tokio stats view for the selected scope">
             ⚡ Tokio Stats
         </button>
+        <button id="arch-btn" onclick="viewTraceGraph()" disabled title="Open the service architecture graph for the selected scope">
+            🕸 Architecture
+        </button>
         <button id="diff-add-btn" onclick="addToDiff()" disabled title="Capture this selection as one side (A, then B) of a differential comparison">
             ➕ Add to diff
         </button>
@@ -1102,6 +1105,8 @@
         document.getElementById('raw-actions').style.display = tab === 'raw' ? 'flex' : 'none';
         document.getElementById('cpu-btn').style.display = tab === 'browse' ? '' : 'none';
         document.getElementById('health-btn').style.display = tab === 'browse' ? '' : 'none';
+        const archBtnEl = document.getElementById('arch-btn');
+        if (archBtnEl) archBtnEl.style.display = tab === 'browse' ? '' : 'none';
         updateSelectionCount();
         syncUrl();
     }
@@ -1758,6 +1763,19 @@
         window.open('tokio_stats.html?' + qs, '_blank');
     }
 
+    function viewTraceGraph() {
+        if (!heatmapSelection || !heatmapSelection.keys.length) return;
+        const bucket = bucketInput.value.trim();
+        if (!bucket) { alert('Bucket is required'); return; }
+        const keys = heatmapSelection.keys;
+        // Same scope vocabulary as flamegraph / tokio-stats — /api/trace-graph
+        // reads bucket/prefix/service/host + start_ns/end_ns and folds the same
+        // selected traces into a service-architecture graph.
+        const scope = Dial9TraceScope.scopeFromKeys(bucket, keys, heatmapSelection.t0, heatmapSelection.t1);
+        const qs = Dial9TraceScope.encodeAggregationParams(new URLSearchParams(), scope);
+        window.open('trace-graph.html?' + qs, '_blank');
+    }
+
     // ── Differential comparison (A/B) ──
     // Two captured scopes, each a URLSearchParams from selectionScope(). Launched
     // into either viz via the shared FlamegraphDiff scope-link codec
@@ -1965,6 +1983,7 @@
         const viewBtn = document.getElementById('view-btn');
         const cpuBtn = document.getElementById('cpu-btn');
         const healthBtn = document.getElementById('health-btn');
+        const archBtn = document.getElementById('arch-btn');
         const diffAddBtn = document.getElementById('diff-add-btn');
         const warn = document.getElementById('selection-warn');
         const count = document.getElementById('selection-count');
@@ -1975,6 +1994,7 @@
                 viewBtn.disabled = true;
                 cpuBtn.disabled = true;
                 healthBtn.disabled = true;
+                if (archBtn) archBtn.disabled = true;
                 diffAddBtn.disabled = true;
                 warn.textContent = '';
                 count.textContent = '';
@@ -1984,6 +2004,9 @@
             viewBtn.disabled = over;
             cpuBtn.disabled = over && !aggregationEnabled;
             healthBtn.disabled = !aggregationEnabled;
+            // Architecture graph runs the same server-side fold as tokio-stats,
+            // so it's an aggregate-only feature enabled under the same condition.
+            if (archBtn) archBtn.disabled = !aggregationEnabled;
             // Diff is an aggregate-only feature (both flamegraph and tokio-stats
             // diffs run the server-side refinement loop per side).
             diffAddBtn.disabled = !aggregationEnabled;

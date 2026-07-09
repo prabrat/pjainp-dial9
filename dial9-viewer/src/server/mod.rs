@@ -19,6 +19,7 @@ pub(crate) mod flamegraph;
 pub(crate) mod metrics;
 mod prefixes;
 pub(crate) mod tokio_stats;
+pub(crate) mod trace_graph;
 mod trace;
 mod upload;
 
@@ -443,6 +444,10 @@ fn api_router(state: AppState) -> Router {
         .route(
             "/tokio-stats",
             axum::routing::get(tokio_stats::get_tokio_stats),
+        )
+        .route(
+            "/trace-graph",
+            axum::routing::get(trace_graph::get_trace_graph),
         )
         .route("/uploaded/{id}", axum::routing::get(upload::get_uploaded))
         .merge(upload_route)
